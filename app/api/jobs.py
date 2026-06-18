@@ -135,6 +135,8 @@ def job_results(job_id: uuid.UUID, db: Session = Depends(get_db)) -> ResultsResp
     breakdown: dict[str, float] = defaultdict(float)
     for t in txns:
         breakdown[t.final_category] += float(t.amount)
+    # Round to 2 dp to avoid float accumulation artifacts in the response.
+    breakdown = {k: round(v, 2) for k, v in breakdown.items()}
 
     summary_full = None
     if job.summary is not None:

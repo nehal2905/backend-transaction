@@ -45,6 +45,7 @@ class Settings(BaseSettings):
         "Flipkart",
         "Jio",
         "Airtel",
+        "MakeMyTrip",
     ]
 
 
