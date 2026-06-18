@@ -67,14 +67,17 @@ def call_gemini_json(prompt: str, response_schema: dict | None = None) -> dict:
         generation_config["response_schema"] = response_schema
 
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": generation_config,
     }
 
     try:
         resp = httpx.post(
             url,
-            params={"key": settings.gemini_api_key},
+            headers={
+                "x-goog-api-key": settings.gemini_api_key,
+                "Content-Type": "application/json",
+            },
             json=payload,
             timeout=60.0,
         )
@@ -90,9 +93,17 @@ def call_gemini_json(prompt: str, response_schema: dict | None = None) -> dict:
 
     try:
         data = resp.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        parts = data["candidates"][0]["content"]["parts"]
+        # Newer models can return multiple parts (and "thought" parts); keep only
+        # the real text parts and concatenate them.
+        text = "".join(
+            p["text"] for p in parts if "text" in p and not p.get("thought")
+        )
     except (KeyError, IndexError, ValueError) as exc:
         raise LLMError(f"Unexpected Gemini response shape: {exc}") from exc
+
+    if not text:
+        raise LLMError("Gemini returned an empty response")
 
     try:
         return json.loads(text)

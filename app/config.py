@@ -21,7 +21,10 @@ class Settings(BaseSettings):
 
     # LLM
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-1.5-flash"
+    # Current GA model on the v1beta generateContent endpoint. gemini-1.5-flash
+    # and gemini-2.0-flash have been retired; override via GEMINI_MODEL if needed
+    # (e.g. "gemini-3.5-flash").
+    gemini_model: str = "gemini-2.5-flash"
     llm_batch_size: int = 25
     llm_max_retries: int = 3
 
