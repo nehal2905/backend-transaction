@@ -1,175 +1,472 @@
 # AI-Powered Transaction Processing Pipeline
 
-An async backend that ingests a transactions CSV, then runs a multi-stage pipeline
-to **clean** the data, **detect anomalies**, **classify** uncategorised rows with an
-LLM, and produce an **AI narrative summary** — all behind a thin FastAPI layer with
-PostgreSQL persistence and a Celery + Redis job queue. The whole stack boots with a
-single `docker compose up`.
+An asynchronous backend system that ingests transaction CSV files, processes them through a multi-stage pipeline, detects anomalies, classifies uncategorised transactions using Google Gemini, and generates an AI-powered spending summary.
+
+The system is built using FastAPI, PostgreSQL, Redis, Celery, Docker, and Google Gemini 2.5 Flash.
+
+---
+
+## Features
+
+* CSV upload and asynchronous processing
+* Data cleaning and normalization
+* Statistical anomaly detection
+* Currency mismatch anomaly detection
+* LLM-based transaction categorization
+* AI-generated spending narrative
+* PostgreSQL persistence
+* Celery + Redis background processing
+* Graceful degradation when LLM services fail
+* Single-command deployment using Docker Compose
 
 ---
 
 ## Architecture
 
-```
-                    ┌──────────────────────────────────────────────┐
-   client  ──POST──▶│  FastAPI (api)                               │
-   (curl)           │  /jobs/upload  /jobs/{id}/status             │
-        ◀──202──────│  /jobs/{id}/results  /jobs                   │
-                    └───────┬───────────────────────┬──────────────┘
-                            │ save CSV              │ create Job(pending)
-                            ▼                        ▼ enqueue process_job.delay()
-                 ┌──────────────────┐       ┌────────────────┐
-                 │ uploads (volume) │       │  Redis broker  │
-                 └────────┬─────────┘       └───────┬────────┘
-                          │ read CSV               │ deliver task
-                          ▼                         ▼
-                    ┌──────────────────────────────────────────────┐
-                    │  Celery worker — process_job(job_id)         │
-                    │  runner: status=processing                   │
-                    │   (a) cleaning  (b) anomaly  (c) classify    │
-                    │   (d) summary   (e) finalize → completed     │
-                    └───────┬───────────────────────┬──────────────┘
-                            │ read/write rows        │ JSON-mode calls
-                            ▼                         ▼
-                    ┌────────────────┐       ┌────────────────┐
-                    │  PostgreSQL    │       │ Gemini 1.5     │
-                    │ Job/Txn/Summary│       │ Flash (LLM)    │
-                    └────────────────┘       └────────────────┘
-```
+![Architecture Diagram](docs/architecture.png)
 
-> A draw.io diagram lives at `docs/architecture.drawio` — export it and link the
-> public version here before submitting.
+### Request Flow
 
-**Layering rationale.** The `app/api/` layer is thin: it only validates input,
-enqueues work, and reads results. All real work lives in `app/pipeline/`, which is
-pure and unit-testable independent of FastAPI/Celery. The `app/llm/` boundary
-isolates the one external dependency that can fail, so all retry/fallback logic
-lives in one place.
+1. Client uploads a CSV file.
+2. FastAPI validates the request and creates a Job record.
+3. A Celery task is queued through Redis.
+4. The worker executes the processing pipeline:
+
+   * Data Cleaning
+   * Anomaly Detection
+   * LLM Classification
+   * LLM Narrative Summary
+   * Result Persistence
+5. Results are stored in PostgreSQL.
+6. Client polls the API for status and results.
 
 ---
 
-## Tech stack
+## Tech Stack
 
-| Concern | Choice |
-|---|---|
-| API | FastAPI + Pydantic v2 |
-| DB | PostgreSQL 16 (SQLAlchemy 2.x + Alembic) |
-| Queue | Celery + Redis |
-| LLM | Gemini 1.5 Flash (free tier, JSON mode) |
-| LLM transport | `httpx` + `tenacity` (exp backoff, 3 retries) |
-| Runtime | Docker + docker compose (4 services) |
+| Component        | Technology              |
+| ---------------- | ----------------------- |
+| API              | FastAPI                 |
+| Database         | PostgreSQL 16           |
+| ORM              | SQLAlchemy 2.x          |
+| Migrations       | Alembic                 |
+| Queue            | Celery                  |
+| Broker           | Redis                   |
+| LLM              | Google Gemini 2.5 Flash |
+| HTTP Client      | httpx                   |
+| Retry Logic      | Tenacity                |
+| Containerization | Docker + Docker Compose |
 
 ---
 
-## Quick start
+## Repository
 
 ```bash
-# 1. Configure secrets
-cp .env.example .env
-#    then edit .env and set GEMINI_API_KEY=...
-#    (free key: https://aistudio.google.com/app/apikey)
+git clone https://github.com/nehal2905/backend-transaction.git
+cd backend-transaction
+```
 
-# 2. Boot everything (postgres + redis + api + worker)
+---
+
+## Quick Start
+
+### 1. Configure Environment
+
+Create a `.env` file:
+
+```env
+DATABASE_URL=postgresql+psycopg2://postgres:postgres@postgres:5432/transactions
+
+CELERY_BROKER_URL=redis://redis:6379/0
+CELERY_RESULT_BACKEND=redis://redis:6379/1
+
+GEMINI_API_KEY=YOUR_API_KEY
+GEMINI_MODEL=gemini-2.5-flash
+
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=postgres
+POSTGRES_DB=transactions
+```
+
+### 2. Start Everything
+
+```bash
 docker compose up --build
 ```
 
-The `api` container runs `alembic upgrade head` automatically before starting, so
-the schema is created on a fresh boot with **zero manual steps**.
+The following services start automatically:
 
-API docs: <http://localhost:8000/docs>
+* FastAPI API
+* PostgreSQL
+* Redis
+* Celery Worker
 
-> No Gemini key? The pipeline still completes: classification batches are marked
-> `llm_failed` and the summary falls back to a deterministic narrative/risk level.
-
----
-
-## Example requests
+Database migrations are applied automatically during startup using:
 
 ```bash
-# Upload a CSV — returns immediately with a job_id (202)
-curl -F "file=@data/transactions.csv" http://localhost:8000/jobs/upload
+alembic upgrade head
+```
 
-# Poll status (includes high-level summary once completed)
-curl http://localhost:8000/jobs/<job_id>/status
+### Running Without a Gemini Key
 
-# Full structured results (409 until completed)
-curl http://localhost:8000/jobs/<job_id>/results
+The application still runs end-to-end without a Gemini API key.
 
-# List all jobs, newest first — with optional status filter
-curl "http://localhost:8000/jobs"
-curl "http://localhost:8000/jobs?status=completed"
+In that case:
+
+* Classification batches are marked `llm_failed=true`
+* Narrative generation falls back to deterministic summaries
+* Jobs still complete successfully
+
+---
+
+## API Documentation
+
+Swagger UI:
+
+```text
+http://localhost:8000/docs
 ```
 
 ---
 
-## The pipeline (`process_job` → `runner.run_pipeline`)
+## API Endpoints
 
-| Step | Module | What it does |
-|---|---|---|
-| a. Cleaning | `pipeline/cleaning.py` | Dates → ISO 8601 (explicit `DD-MM-YYYY` vs `YYYY/MM/DD`), strip `$`, uppercase status/currency, blank category → `Uncategorised`, drop exact duplicate rows. Records `row_count_raw` and `row_count_clean`. |
-| b. Anomaly | `pipeline/anomaly.py` | Flags `amount > 3× median` (median per **(account_id, currency)** so INR/USD scales never mix) and `USD on a domestic-only merchant` (Swiggy/Ola/IRCTC/…). Multiple reasons join with `; `. |
-| c. Classify | `pipeline/classify.py` | LLM categorizes **only** originally-blank rows into 8 fixed labels, **batched** (`LLM_BATCH_SIZE`, default 25), never one call per row. |
-| d. Summary | `pipeline/summary.py` | **Single** LLM call over aggregates (not raw rows) → narrative + risk level. Numeric totals are computed locally as ground truth. Persisted as a `JobSummary` row. |
-| e. Retries | `llm/client.py` | Every LLM call wrapped in tenacity: `stop_after_attempt(3)` + `wait_exponential`. Exhausted classification batch → `llm_failed=true`, continue. Exhausted summary → deterministic fallback. **LLM failure never fails the job.** |
+### Upload CSV
 
-### Status lifecycle
-
-```
-pending ──(worker picks up)──▶ processing ──(a–e ok)──▶ completed
-                                   └──(unhandled error)──▶ failed (error_message set)
+```http
+POST /jobs/upload
 ```
 
-An LLM batch/summary failure is **not** a job failure — it degrades gracefully and
-the job still reaches `completed`.
+Example:
+
+```bash
+curl -F "file=@data/transactions.csv" \
+http://localhost:8000/jobs/upload
+```
+
+Response:
+
+```json
+{
+  "job_id": "f48189e3-d5bd-4b26-b5c1-7663a0ece0b0",
+  "status": "pending"
+}
+```
 
 ---
 
-## Data model
+### Job Status
 
-- **Job** — `filename, file_path, status, row_count_raw, row_count_clean, error_message, created_at, completed_at`
-- **Transaction** — all source fields + `is_anomaly, anomaly_reason, llm_category, llm_raw_response, llm_failed` (FK → Job)
-- **JobSummary** — `total_spend_inr, total_spend_usd, top_merchants (JSONB), anomaly_count, narrative, risk_level` (1-1 with Job)
-
-ERD: `Job 1──* Transaction` and `Job 1──1 JobSummary`.
-
----
-
-## Bottlenecks & scale (where it breaks at 100×)
-
-- **Whole file processed in one in-memory task.** 90 rows is fine; 9M rows OOMs the
-  worker and one job monopolizes a slot. → Stream/chunk the CSV and fan out into
-  per-chunk subtasks (Celery `chord`/`group`), then aggregate.
-- **Row-by-row ORM writes.** → Bulk insert (`COPY` / `execute_values`) + PgBouncer
-  pooling (api+worker exhaust Postgres connections first at 100×).
-- **LLM is the throughput ceiling and cost center.** → Dedicated rate-limited LLM
-  queue, async concurrency caps, cache classifications for repeated
-  `(merchant, note)` pairs, consider a cheaper/local model at high volume.
-- **Single Redis + single Postgres.** → Redis cluster / separate result backend,
-  Postgres read replicas for read-heavy `GET /results`, S3 for uploads instead of a
-  local volume.
-- **Polling is wasteful.** → Webhooks/SSE for completion; idempotency keys on upload.
-
-Trade-off throughout: more moving parts and operational complexity vs. horizontal
-scalability — justified only past the volume where the monolith stalls.
-
----
-
-## Project layout
-
+```http
+GET /jobs/{job_id}/status
 ```
+
+Possible states:
+
+* pending
+* processing
+* completed
+* failed
+
+Returns high-level summary information after completion.
+
+---
+
+### Job Results
+
+```http
+GET /jobs/{job_id}/results
+```
+
+Returns:
+
+* Cleaned transactions
+* Detected anomalies
+* Category breakdown
+* AI-generated summary
+
+---
+
+### List Jobs
+
+```http
+GET /jobs
+```
+
+Optional filter:
+
+```http
+GET /jobs?status=completed
+```
+
+---
+
+## Processing Pipeline
+
+### 1. Data Cleaning
+
+Implemented in:
+
+```text
+app/pipeline/cleaning.py
+```
+
+Performs:
+
+* Date normalization to ISO-8601
+* Currency symbol stripping
+* Currency normalization
+* Status normalization
+* Missing category handling
+* Exact duplicate removal
+
+---
+
+### 2. Anomaly Detection
+
+Implemented in:
+
+```text
+app/pipeline/anomaly.py
+```
+
+#### Statistical Outliers
+
+Transactions are flagged when:
+
+```text
+amount > 3 × median(account_id, currency)
+```
+
+Median is calculated per `(account_id, currency)` to avoid mixing INR and USD distributions.
+
+#### Currency Mismatch Detection
+
+Transactions are flagged when:
+
+```text
+currency = USD
+AND merchant is domestic-only
+```
+
+Examples:
+
+* Swiggy
+* Ola
+* Zomato
+* IRCTC
+* Flipkart
+* Jio
+* Airtel
+* MakeMyTrip
+
+---
+
+### 3. LLM Classification
+
+Implemented in:
+
+```text
+app/pipeline/classify.py
+```
+
+Only transactions with missing categories are sent to Gemini.
+
+Supported categories:
+
+* Food
+* Shopping
+* Travel
+* Transport
+* Utilities
+* Cash Withdrawal
+* Entertainment
+* Other
+
+Classification requests are batched to minimize API calls.
+
+---
+
+### 4. AI Narrative Summary
+
+Implemented in:
+
+```text
+app/pipeline/summary.py
+```
+
+A single Gemini call generates:
+
+* Total spend by currency
+* Top merchants
+* Anomaly count
+* Spending narrative
+* Risk level
+
+Possible risk levels:
+
+* Low
+* Medium
+* High
+
+---
+
+### 5. Retry & Failure Handling
+
+Implemented in:
+
+```text
+app/llm/client.py
+```
+
+Every Gemini request uses:
+
+```text
+stop_after_attempt(3)
+wait_exponential()
+```
+
+If classification fails:
+
+```text
+llm_failed = true
+```
+
+and processing continues.
+
+If summary generation fails:
+
+A deterministic fallback summary is generated.
+
+The job never fails solely because the LLM is unavailable.
+
+---
+
+## Data Model
+
+### Job
+
+Stores:
+
+* status
+* filename
+* file path
+* row counts
+* timestamps
+* error messages
+
+### Transaction
+
+Stores:
+
+* original transaction fields
+* anomaly metadata
+* LLM classification data
+
+### JobSummary
+
+Stores:
+
+* total spend by currency
+* top merchants
+* anomaly count
+* narrative
+* risk level
+
+Relationships:
+
+```text
+Job 1 ─── * Transaction
+Job 1 ─── 1 JobSummary
+```
+
+---
+
+## Example Dataset Results
+
+Latest run using the provided sample dataset:
+
+| Metric             | Value               |
+| ------------------ | ------------------- |
+| Raw Rows           | 95                  |
+| Clean Rows         | 85                  |
+| Duplicates Removed | 10                  |
+| Missing txn_id     | 4                   |
+| Missing Categories | 15 → 13 after dedup |
+| Anomalies          | 15                  |
+| Risk Level         | Medium              |
+| Total INR Spend    | ₹1,339,923.00       |
+| Total USD Spend    | $74,185.14          |
+
+### Anomaly Breakdown
+
+* 5 Statistical Outliers
+* 10 Currency Mismatches
+
+Examples:
+
+* USD transaction on Zomato
+* USD transaction on MakeMyTrip
+* Transactions exceeding 3× account median
+
+---
+
+## Scale Considerations
+
+Current implementation is optimized for assignment-scale workloads.
+
+At significantly larger traffic volumes:
+
+### Current Bottlenecks
+
+* Entire CSV processed within a single worker task
+* Row-by-row ORM inserts
+* Shared Redis broker/backend
+* Polling-based completion tracking
+* External LLM throughput limits
+
+### Future Improvements
+
+* Chunked CSV processing
+* Celery groups/chords
+* Bulk inserts
+* PgBouncer connection pooling
+* Dedicated LLM queue
+* Response caching
+* S3-based object storage
+* Webhooks or Server-Sent Events
+
+Trade-off: increased operational complexity in exchange for horizontal scalability.
+
+---
+
+## Project Structure
+
+```text
 app/
-  main.py            FastAPI app + router include + startup
-  config.py          pydantic-settings env config
-  database.py        engine / SessionLocal / get_db
-  celery_app.py      Celery instance (broker/backend)
-  models.py          SQLAlchemy: Job, Transaction, JobSummary
-  schemas.py         Pydantic request/response models
-  enums.py           JobStatus, TxnStatus, Currency, RiskLevel, categories
-  storage.py         save/read uploaded CSV on shared volume
-  tasks.py           Celery task process_job(job_id)
-  api/jobs.py        the 4 endpoints
-  pipeline/          cleaning, anomaly, classify, summary, runner
-  llm/               client (Gemini, tenacity) + prompts
-migrations/          Alembic env + versions
-data/transactions.csv  sample input
+├── api/
+├── llm/
+├── pipeline/
+├── main.py
+├── tasks.py
+├── models.py
+├── schemas.py
+├── config.py
+├── database.py
+├── celery_app.py
+
+migrations/
+data/
+docs/
+docker-compose.yml
+Dockerfile
+README.md
 ```
+
+---
+
+## Author
+
+Backend Developer Internship Assignment Submission
+
+Akula Nehal
